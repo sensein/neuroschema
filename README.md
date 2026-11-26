@@ -1,6 +1,6 @@
 # NeuroSchema — neuroschema.org
 
-A curated catalog of neuroscience ontologies, schemas, vocabularies and data standards. Every entry is evaluated automatically against the FAIR principles, maintenance and community adoption, with a progressive inactivity penalty. Each run records the exact version evaluated and keeps full provenance. The site is fully static, with no runtime dependencies.
+A curated catalog of neuroscience ontologies, schemas, vocabularies and data standards. Every entry is evaluated automatically against the FAIR principles, maintenance and community adoption, with a progressive inactivity penalty. Each run records the exact version evaluated and keeps full provenance. The site is served by a FastAPI backend (JSON API + MCP server) and a web server that renders the same page templates as the static build; the evaluation pipeline is Node. The same backend and UI code runs SchemaScope.
 
 <img width="1508" height="847" alt="Screenshot 2026-10-26 at 4 45 05 PM" src="https://github.com/user-attachments/assets/87855255-1a5a-4bf9-b9b8-ea2ccb0c64c0" />
 
@@ -59,6 +59,29 @@ Grades: A ≥ 85, B ≥ 70, C ≥ 55, D ≥ 40, E < 40. The rules live in [`scri
 
 > **Evaluation runs locally.** Run `npm run refresh` (or `scripts/refresh.sh --push`) to update scores: it pulls, runs the OOPS!/ROBOT quality checks in Docker, evaluates, rebuilds and commits `data/evaluation.json`, `data/runs/` and `data/quality/`. Your local run is the only writer of those files, so they never conflict. GitHub Actions only handle submissions and their checks. Set `GITHUB_TOKEN` (or log in with `gh`) first.
 
+## API, MCP and UI
+
+```
+data/*.json ──ingest──▶ Postgres ─────────────────▶ FastAPI  /api/…  (JSON, OpenAPI at /docs)
+ (evaluate,                                              │       /mcp/   (MCP, streamable HTTP)
+  rescore, quality)                                      └──▶ web/server.mjs: pages rendered by scripts/site.mjs
+                                                              (the same templates as the static build)
+```
+
+```bash
+npm run ingest        # load data/ into Postgres at DATABASE_URL (incremental; --rebuild to start over). refresh.sh runs it too
+npm run api           # API + MCP on http://127.0.0.1:8000  (needs uv: https://docs.astral.sh/uv/)
+npm run web           # site on http://localhost:3000, rendered from the API's data
+npm run test:api      # backend tests
+cd web && npm run check-links -- http://localhost:3000 http://127.0.0.1:8000   # crawl the running site for broken links
+```
+
+- **API** (`backend/catalog_api/`): `/api/entries` (search with `q`, filters `category`, `kind`, `grade`, `format`, `registry`, `legacy`, `sort`, pagination and facet counts), `/api/entries/{id}`, `/api/entries/{id}/history`, `/api/categories`, `/api/runs`, `/api/runs/{id}`, `/api/stats`, `/api/meta`.
+- **MCP** at `/mcp/`: tools `search_catalog`, `get_entry`, `get_entry_history`, `list_categories`, `catalog_stats`, `scoring_rubric`, `recommend_resources`. Needs a personal access token with the `mcp` scope. Tool calls go into the anonymous search log (source `mcp`) unless the token's owner turned off *Help improve recommendations*. Add it to Claude Code with `claude mcp add --transport http neuroschema http://127.0.0.1:8000/mcp/`, or run it over stdio with `npm run mcp:stdio`.
+- **Site** (`web/server.mjs`): renders the static site's own templates (`scripts/site.mjs`) from API data, so pages are identical to `npm run build` output; reloads automatically after an ingest.
+
+Environment: `CATALOG_REPO` (repository root; default: parent of `backend/`), `DATABASE_URL` (Postgres; default `postgresql://catalog:catalog@127.0.0.1:5433/catalog`), `CORS_ORIGINS`, `MCP_ALLOWED_HOSTS` (public host name(s) of the API, e.g. `api.neuroschema.org`; localhost always works) for the API; `API_URL`, `PORT`, `HOST`, `POLL_SECONDS`, `CACHE_MB` for the site server.
+
 ## Layout
 
 | Path | What |
@@ -89,9 +112,41 @@ To change the catalog, rubric or code and preview the effect on scores locally, 
 - **Actions → General:** allow GitHub Actions to create pull requests.
 - Set `"repository"` in `site.config.json` to the GitHub URL so the site links to the issue form.
 
-## Deploy on Vercel
+## Deploy
 
-Import the repository. `vercel.json` already sets the build command and output directory. Then add `neuroschema.org` under **Settings → Domains**: an `A` record to `76.76.21.21` for the apex domain, and a `CNAME` record to `cname.vercel-dns.com` for `www`.
+Everything runs in Docker Compose: Postgres, an `ingest` job (loads `data/`), the API (+ MCP), the site server, the chat model (Ollama, optional) and Caddy (HTTPS).
+
+**Sandbox** (the full stack on one machine, sign-in without a GitHub app):
+
+```bash
+docker compose -f infrastructure/sandbox/docker-compose.yml up -d --build
+open http://localhost:8390          # API on :8391, Postgres on 127.0.0.1:5434
+```
+
+**Production** (one server, e.g. a 4–6 vCPU / 8–12 GB VPS; `infrastructure/production/`):
+
+```bash
+cp infrastructure/production/.env.example infrastructure/production/.env   # fill in domain, secrets, GitHub app
+sudo mkdir -p /srv/backups/neuroschema
+docker compose -f infrastructure/production/docker-compose.yml --env-file infrastructure/production/.env --profile llm up -d --build
+# after each evaluation run (git pull updated data/):
+docker compose -f infrastructure/production/docker-compose.yml --env-file infrastructure/production/.env run --rm ingest
+```
+
+Leave out `--profile llm` to run without the chat model (answers then list ranked matches only). Point the domain's `A` record at the server; Caddy gets the certificate.
+
+**Database backups** (`backup` service, `infrastructure/production/backup.sh`; see D-034 in DECISIONS.md): a `pg_dump` every night at `BACKUP_AT` (02:30 UTC) into `BACKUP_DIR` (`/srv/backups/neuroschema`), keeping 7 daily and 4 weekly dumps. Keep that folder inside the host's own backup (e.g. Contabo Auto Backup) so the dumps leave the server. The catalog tables can always be rebuilt with `ingest`; the dumps protect accounts, tokens, submissions, the audit log, saved chats and the logs.
+
+```bash
+dc="docker compose -f infrastructure/production/docker-compose.yml --env-file infrastructure/production/.env"
+$dc exec backup backup.sh now                 # dump right away
+$dc exec backup backup.sh check               # restore the newest dump into a throwaway database and compare row counts (changes nothing)
+$dc stop api web && $dc exec backup backup.sh restore <file>.dump && $dc start api web   # replace the live database
+```
+
+Run `check` after the first night and now and then after that.
+
+**Static build** (same pages, no accounts, chat or MCP): `node scripts/build.mjs` → `dist/`; `vercel.json` sets the build command and output directory. The full stack needs long-running containers (Postgres, the model), so it does not run on Vercel.
 
 ## SEO
 

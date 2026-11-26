@@ -12,6 +12,154 @@
     try { localStorage.setItem("theme", root.dataset.theme); } catch {}
   });
 
+  // Menu button (small screens): opens the links as a panel under the header.
+  const navToggle = $(".nav-toggle");
+  const navLinks = $("#nav-links");
+  if (navToggle && navLinks) {
+    const setOpen = (open) => {
+      navToggle.setAttribute("aria-expanded", String(open));
+      document.body.classList.toggle("nav-open", open);
+    };
+    navToggle.addEventListener("click", () => setOpen(navToggle.getAttribute("aria-expanded") !== "true"));
+    navLinks.addEventListener("click", (e) => e.target.closest("a") && setOpen(false));
+    document.addEventListener("keydown", (e) => e.key === "Escape" && setOpen(false));
+    matchMedia("(min-width: 1101px)").addEventListener("change", (m) => m.matches && setOpen(false));
+  }
+
+  // Menu groups (Catalog, About, the account menu): hover or focus opens them on wide screens; a click or tap toggles.
+  const closeGroups = (except) => $$("[data-nav-group].open").forEach((g) => { if (g !== except) { g.classList.remove("open"); g.querySelector(".nav-group-btn")?.setAttribute("aria-expanded", "false"); } });
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest(".nav-group-btn");
+    if (b) {
+      const g = b.closest("[data-nav-group]");
+      const open = !g.classList.contains("open");
+      closeGroups(g);
+      g.classList.toggle("open", open);
+      b.setAttribute("aria-expanded", String(open));
+    } else if (!e.target.closest("[data-nav-group]")) closeGroups();
+  });
+  document.addEventListener("keydown", (e) => e.key === "Escape" && closeGroups());
+
+  // Starting a chat from elsewhere (recommend landing page): the question goes to the chat page in session storage,
+  // not in the URL, and is sent from there with POST.
+  const startChat = (q) => {
+    if (!q?.trim()) return;
+    try { sessionStorage.setItem("ask-question", q.trim()); } catch {}
+    location.href = "/recommend/ask/";
+  };
+  document.addEventListener("submit", (e) => {
+    const f = e.target.closest("[data-ask-start]");
+    if (!f) return;
+    e.preventDefault();
+    startChat(f.elements.q.value);
+  });
+  document.addEventListener("click", (e) => {
+    const a = e.target.closest("[data-ask-q]");
+    if (!a) return;
+    e.preventDefault();
+    startChat(a.dataset.askQ);
+  });
+
+  // Document pages: highlight the section being read in "On this page".
+  const docToc = $("[data-doc-toc]");
+  if (docToc && "IntersectionObserver" in window) {
+    const links = [...docToc.querySelectorAll("a")];
+    const spy = new IntersectionObserver((entries) => {
+      for (const en of entries) if (en.isIntersecting) links.forEach((a) => a.classList.toggle("active", a.getAttribute("href") === `#${en.target.id}`));
+    }, { rootMargin: "-20% 0px -70% 0px" });
+    links.forEach((a) => { const t = document.getElementById(a.getAttribute("href").slice(1)); if (t) spy.observe(t); });
+  }
+
+  // Account link: "Sign in", or the signed-in user's avatar and name (from the API on this origin).
+  const account = $("[data-account]");
+  if (account) account.href = `/api/auth/github/login?next=${encodeURIComponent(location.pathname + location.search)}`;
+  const signinError = new URLSearchParams(location.search).get("signin_error");
+  if (signinError) {
+    const note = document.createElement("p");
+    note.className = "signin-notice";
+    note.setAttribute("role", "alert");
+    note.textContent = signinError === "access_denied" ? "Sign-in was cancelled on GitHub." : `Sign-in didn't work (${signinError}). Please try again.`;
+    document.querySelector("main")?.prepend(note);
+    setTimeout(() => note.remove(), 8000);
+  }
+  if (account && location.protocol.startsWith("http")) {
+    fetch("/api/auth/session", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((s) => {
+        if (!s?.user) return;
+        const u = s.user;
+        account.href = "/account/";
+        account.classList.add("signed-in");
+        account.title = `Signed in as @${u.login}`;
+        account.innerHTML = (u.avatarUrl ? `<img src="${u.avatarUrl}&s=48" alt="" width="22" height="22">` : "") + `<span data-account-label></span>`;
+        account.querySelector("[data-account-label]").textContent = u.name?.split(" ")[0] || u.login;
+        // Signed in: the name opens a small menu (your account, tokens, admin for superadmins, sign out).
+        const wrap = document.createElement("div");
+        wrap.className = "nav-group nav-user";
+        wrap.dataset.navGroup = "";
+        account.replaceWith(wrap);
+        account.classList.add("nav-group-btn");
+        account.setAttribute("aria-haspopup", "true");
+        wrap.append(account);
+        const menu = document.createElement("div");
+        menu.className = "nav-menu";
+        const item = (href, title, sub) => `<a href="${href}"><b>${title}</b>${sub ? `<small>${sub}</small>` : ""}</a>`;
+        menu.innerHTML = `<div class="nav-user-head"><b></b><small></small></div>` +
+          item("/account/", "Your account", "Overview, submissions and activity") +
+          item("/account/#tokens", "Access tokens", "For the API and AI assistants") +
+          (u.superadmin ? item("/admin/", "Admin dashboard", "Review submissions, users and limits") : "") +
+          `<button type="button" class="nav-signout" data-nav-signout>Sign out</button>`;
+        menu.querySelector(".nav-user-head b").textContent = u.name || u.login;
+        menu.querySelector(".nav-user-head small").textContent = `@${u.login}`;
+        wrap.append(menu);
+        menu.querySelector("[data-nav-signout]").addEventListener("click", async () => {
+          await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" }).catch(() => {});
+          location.href = "/";
+        });
+        document.dispatchEvent(new CustomEvent("session", { detail: s }));
+      })
+      .catch(() => {});
+  }
+
+  // Anonymous search log (privacy policy: /privacy/#chat): what people searched for, how many results, the top results,
+  // and which one they opened. Logged once typing pauses; a click before that is sent with the log entry.
+  const logSession = () => {
+    try {
+      let id = JSON.parse(sessionStorage.getItem("chat-session"));
+      if (!id) { id = crypto.randomUUID?.() || String(Math.random()).slice(2); sessionStorage.setItem("chat-session", JSON.stringify(id)); }
+      return id;
+    } catch { return null; }
+  };
+  const logState = new WeakMap();
+  const postLog = (path, body) => fetch(path, { method: "POST", credentials: "same-origin", keepalive: true, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  window.searchLog = (source, q, filters, ids, count, container) => {
+    if (!container || !location.protocol.startsWith("http")) return;
+    const clean = Object.fromEntries(Object.entries(filters || {}).filter(([, v]) => v !== "" && v != null && v !== false));
+    let st = logState.get(container);
+    if (!st) {
+      st = {};
+      logState.set(container, st);
+      container.addEventListener("click", (e) => {
+        const a = e.target.closest('a[href^="/o/"]');
+        if (!a) return;
+        const entry = decodeURIComponent(a.getAttribute("href").split("/")[2] || "");
+        if (st.id) postLog(`/api/logs/search/${encodeURIComponent(st.id)}/click`, { entryId: entry }).catch(() => {});
+        else if (st.body) { clearTimeout(st.timer); postLog("/api/logs/search", { ...st.body, clicked: [entry] }).catch(() => {}); st.body = null; }
+      });
+    }
+    clearTimeout(st.timer);
+    st.id = null;
+    st.body = null;
+    if (!(q || "").trim() && !Object.keys(clean).length) return;
+    st.body = { source, q: (q || "").trim() || null, filters: clean, resultCount: count, resultIds: ids.slice(0, 20), session: logSession() };
+    st.timer = setTimeout(() => {
+      const body = st.body;
+      if (!body) return;
+      st.body = null;
+      postLog("/api/logs/search", body).then((r) => r.json()).then((d) => { st.id = d.id; }).catch(() => {});
+    }, 1500);
+  };
+
   // Catalog explorer (home page)
   const grid = $("#cards");
   const q = $("#q");
@@ -54,6 +202,8 @@
       cards.sort(sorters[f.sort.value] || sorters.score).forEach((c) => grid.appendChild(c));
       count.textContent = `${n} of ${cards.length} resources`;
       empty.hidden = n > 0;
+      window.searchLog?.("catalog", q.value, { category: f.cat.value, kind: f.kind.value, species: f.species.value, grade: f.grade.value, activeOnly: f.active.checked },
+        cards.filter((c) => !c.hidden).slice(0, 20).map((c) => (c.querySelector('a[href^="/o/"]')?.getAttribute("href") || "").split("/")[2]).filter(Boolean), n, grid);
       const sis = $("#sister-link");
       if (sis && n === 0) sis.href = q.value.trim() ? `${sis.origin}/search/?q=${encodeURIComponent(q.value.trim())}` : `${sis.origin}/catalog/`;
       if (push) {
@@ -97,12 +247,38 @@
     }
   });
 
-  // Sortable tables
+  // Long tables: the first rows come with the page; the rest (data-more) load after first paint and are appended
+  // in small batches while the browser is idle, so the page never freezes. table.more resolves when all are in.
+  const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 16));
+  for (const table of $$("table[data-more]")) {
+    const status = table.closest("section")?.querySelector("[data-more-status]");
+    table.more = fetch(table.dataset.more)
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((html) => new Promise((done) => {
+        const tpl = document.createElement("template");
+        tpl.innerHTML = `<table><tbody>${html}</tbody></table>`;
+        const rows = [...tpl.content.querySelectorAll("tr")];
+        const tbody = table.tBodies[0];
+        const step = () => {
+          const frag = document.createDocumentFragment();
+          rows.splice(0, 250).forEach((tr) => frag.appendChild(tr));
+          tbody.appendChild(frag);
+          if (rows.length) idle(step);
+          else done();
+        };
+        idle(step);
+      }))
+      .then(() => status && (status.hidden = true))
+      .catch(() => status && (status.textContent = "Couldn't load the remaining rows. Reload the page to try again."));
+  }
+
+  // Sortable tables (wait for any rows still loading, so a sort covers the whole table)
   for (const table of $$("table.sortable")) {
     const ths = $$("th", table);
     ths.forEach((th, i) => {
       th.tabIndex = 0;
-      const sort = () => {
+      const sort = async () => {
+        await table.more?.catch(() => {});
         const dir = th.getAttribute("aria-sort") === "descending" ? "ascending" : "descending";
         ths.forEach((x) => x.removeAttribute("aria-sort"));
         th.setAttribute("aria-sort", dir);
